@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Iterator
 
 from imap_api import config
 from imap_api.core.mime import parse_message
@@ -9,6 +10,12 @@ from imap_api.storage import db
 
 logger = logging.getLogger(__name__)
 
+# aioimaplib only allows UID COPY/FETCH/EXPUNGE/STORE — UID SEARCH is rejected.
+# We use UID FETCH ranges to discover new UIDs (incremental), and regular SEARCH
+# + plain FETCH (UID) to discover UIDs for the initial date-bounded sync.
+
+
+# ── Low-level helpers ────────────────────────────────────────────────────────
 
 def extract_uidvalidity(lines: list) -> int | None:
     for line in lines:
@@ -19,7 +26,7 @@ def extract_uidvalidity(lines: list) -> int | None:
     return None
 
 
-def parse_uid_list(data: bytes | str) -> list[int]:
+def _parse_numbers(data: bytes | str) -> list[int]:
     s = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
     result = []
     for token in s.strip().split():
@@ -30,8 +37,23 @@ def parse_uid_list(data: bytes | str) -> list[int]:
     return sorted(result)
 
 
+def _extract_uids(lines: list) -> list[int]:
+    """Pull every UID <n> occurrence out of a FETCH response."""
+    uids: set[int] = set()
+    for line in lines:
+        s = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else str(line)
+        for m in re.finditer(r"\bUID (\d+)", s, re.IGNORECASE):
+            uids.add(int(m.group(1)))
+    return sorted(uids)
+
+
+def _batched(items: list, size: int) -> Iterator[list]:
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
 def parse_flags(raw: str) -> list[str]:
-    return [f.strip() for f in raw.strip().split() if f.strip() and f.strip() not in ("(", ")")]
+    return [f.strip() for f in raw.strip().split() if f.strip() not in ("(", ")")]
 
 
 def parse_imap_date(date_str: str) -> str | None:
@@ -52,7 +74,6 @@ def parse_fetch_response(lines: list) -> tuple[bytes | None, str, str, int]:
     internaldate = ""
     flags = ""
     size = 0
-
     for line in lines:
         if isinstance(line, (bytes, bytearray)):
             b = bytes(line)
@@ -69,9 +90,31 @@ def parse_fetch_response(lines: list) -> tuple[bytes | None, str, str, int]:
             m = re.search(r'RFC822\.SIZE (\d+)', s, re.IGNORECASE)
             if m:
                 size = int(m.group(1))
-
     return raw, internaldate, flags, size
 
+
+# ── UID discovery (no UID SEARCH) ───────────────────────────────────────────
+
+async def _uid_range_fetch(client, uid_range: str) -> list[int]:
+    """UID FETCH <range> (UID) — valid aioimaplib UID command, returns UID list."""
+    resp = await client.uid("fetch", uid_range, "(UID)")
+    if resp.result != "OK":
+        return []
+    return _extract_uids(resp.lines)
+
+
+async def _seq_to_uids(client, seq_nums: list[int]) -> list[int]:
+    """Regular FETCH <seqs> (UID) — converts sequence numbers to UIDs."""
+    uids: list[int] = []
+    for batch in _batched(seq_nums, 100):
+        seq_range = ",".join(str(s) for s in batch)
+        resp = await client.fetch(seq_range, "(UID)")
+        if resp.result == "OK":
+            uids.extend(_extract_uids(resp.lines))
+    return sorted(set(uids))
+
+
+# ── Sync state persistence ───────────────────────────────────────────────────
 
 async def get_sync_state(folder: str) -> dict | None:
     conn = db.get_db()
@@ -99,15 +142,12 @@ async def save_sync_state(folder: str, uidvalidity: int, last_seen_uid: int) -> 
 
 
 async def reconcile_uidvalidity(folder: str, server_uidvalidity: int) -> int:
-    """Return last_seen_uid to use for the next incremental sync (0 means start fresh)."""
+    """Return last_seen_uid to use for next sync (0 = start fresh)."""
     state = await get_sync_state(folder)
-
     if state is None:
         return 0
-
     if state["uidvalidity"] == server_uidvalidity:
         return state["last_seen_uid"] or 0
-
     logger.warning(
         "UIDVALIDITY changed for %s (%s → %s); resetting sync state",
         folder, state["uidvalidity"], server_uidvalidity,
@@ -119,44 +159,25 @@ async def reconcile_uidvalidity(folder: str, server_uidvalidity: int) -> int:
     return 0
 
 
+# ── Public entry point ───────────────────────────────────────────────────────
+
 async def incremental_sync(client, folder: str, uidvalidity: int, last_seen_uid: int) -> int:
     """Fetch and store all emails newer than last_seen_uid. Returns new last_seen_uid."""
     if last_seen_uid == 0:
-        if config.INITIAL_SYNC_DAYS == 0:
-            resp = await client.uid("search", "ALL")
-            if resp.result == "OK" and resp.lines:
-                uids = parse_uid_list(resp.lines[0])
-                max_uid = max(uids) if uids else 0
-            else:
-                max_uid = 0
-            await save_sync_state(folder, uidvalidity, max_uid)
-            return max_uid
+        return await _initial_sync(client, folder, uidvalidity)
 
-        since = (datetime.now(timezone.utc) - timedelta(days=config.INITIAL_SYNC_DAYS))
-        date_str = since.strftime("%d-%b-%Y")
-        resp = await client.uid("search", f"SINCE {date_str}")
-    else:
-        resp = await client.uid("search", f"UID {last_seen_uid + 1}:*")
-
-    if resp.result != "OK":
-        logger.error("UID SEARCH failed for %s: %s", folder, resp)
-        return last_seen_uid
-
-    raw_line = resp.lines[0] if resp.lines else b""
-    uids = parse_uid_list(raw_line)
-
+    # UID FETCH range — discovers any UIDs above last_seen_uid without UID SEARCH
+    uids = await _uid_range_fetch(client, f"{last_seen_uid + 1}:*")
     if not uids:
         await save_sync_state(folder, uidvalidity, last_seen_uid)
         return last_seen_uid
 
-    logger.info("Syncing %d email(s) in %s", len(uids), folder)
+    logger.info("Syncing %d new email(s) in %s", len(uids), folder)
     new_max = last_seen_uid
-
     for uid in uids:
         try:
-            stored_uid = await _fetch_and_store(client, folder, uidvalidity, uid)
-            if stored_uid > new_max:
-                new_max = stored_uid
+            if await _fetch_and_store(client, folder, uidvalidity, uid):
+                new_max = max(new_max, uid)
         except Exception as exc:
             logger.error("Failed to fetch UID %d in %s: %s", uid, folder, exc)
 
@@ -164,29 +185,80 @@ async def incremental_sync(client, folder: str, uidvalidity: int, last_seen_uid:
     return new_max
 
 
-async def _fetch_and_store(client, folder: str, uidvalidity: int, uid: int) -> int:
+async def _initial_sync(client, folder: str, uidvalidity: int) -> int:
+    if config.INITIAL_SYNC_DAYS == 0:
+        # Just record current max UID as baseline; do not pull history
+        uids = await _uid_range_fetch(client, "*")
+        max_uid = max(uids) if uids else 0
+        await save_sync_state(folder, uidvalidity, max_uid)
+        logger.info("INITIAL_SYNC_DAYS=0: baseline UID %d for %s", max_uid, folder)
+        return max_uid
+
+    since = datetime.now(timezone.utc) - timedelta(days=config.INITIAL_SYNC_DAYS)
+    date_str = since.strftime("%d-%b-%Y")
+
+    # Regular SEARCH returns sequence numbers (aioimaplib does not block this)
+    resp = await client.search("SINCE", date_str)
+    if resp.result != "OK":
+        logger.error("SEARCH SINCE failed for %s", folder)
+        return 0
+
+    seq_nums = _parse_numbers(resp.lines[0] if resp.lines else b"")
+    if not seq_nums:
+        await save_sync_state(folder, uidvalidity, 0)
+        return 0
+
+    # Convert sequence numbers → UIDs via plain FETCH (UID)
+    uids = await _seq_to_uids(client, seq_nums)
+    if not uids:
+        await save_sync_state(folder, uidvalidity, 0)
+        return 0
+
+    logger.info(
+        "Initial sync: %d email(s) in last %d days for %s",
+        len(uids), config.INITIAL_SYNC_DAYS, folder,
+    )
+    new_max = 0
+    for uid in uids:
+        try:
+            if await _fetch_and_store(client, folder, uidvalidity, uid):
+                new_max = max(new_max, uid)
+        except Exception as exc:
+            logger.error("Failed to fetch UID %d in %s: %s", uid, folder, exc)
+
+    await save_sync_state(folder, uidvalidity, new_max)
+    return new_max
+
+
+# ── Per-message fetch + store ────────────────────────────────────────────────
+
+async def _fetch_and_store(client, folder: str, uidvalidity: int, uid: int) -> bool:
+    """Fetch one email by UID and insert into DB. Returns True if stored."""
     resp = await client.uid(
         "fetch", str(uid),
         "(RFC822 INTERNALDATE FLAGS RFC822.SIZE)",
     )
     if resp.result != "OK":
-        return uid
+        return False
 
     raw, internaldate_str, flags_str, size = parse_fetch_response(resp.lines)
-
     if raw is None:
-        return uid
+        return False
 
     if len(raw) > config.MAX_FETCH_SIZE:
-        resp2 = await client.uid("fetch", str(uid), "(BODY[HEADER] INTERNALDATE FLAGS RFC822.SIZE)")
+        # Too large — fall back to headers only
+        resp2 = await client.uid(
+            "fetch", str(uid),
+            "(BODY[HEADER] INTERNALDATE FLAGS RFC822.SIZE)",
+        )
         raw2, internaldate_str, flags_str, size = parse_fetch_response(resp2.lines)
         if raw2 is None:
-            return uid
+            return False
         fields, attachments = parse_message(raw2, False, False, config.MAX_FETCH_SIZE)
         fields["truncated"] = 1
     else:
         fields, attachments = parse_message(
-            raw, config.FETCH_BODY, config.STORE_ATTACHMENTS, config.MAX_FETCH_SIZE
+            raw, config.FETCH_BODY, config.STORE_ATTACHMENTS, config.MAX_FETCH_SIZE,
         )
 
     internal_date = parse_imap_date(internaldate_str)
@@ -194,14 +266,14 @@ async def _fetch_and_store(client, folder: str, uidvalidity: int, uid: int) -> i
 
     conn = db.get_db()
     async with db.write_lock:
-        # Cross-UIDVALIDITY dedup by Message-ID
+        # Cross-UIDVALIDITY dedup via Message-ID
         if fields["message_id"]:
             async with conn.execute(
                 "SELECT id FROM emails WHERE message_id=? AND folder=?",
                 (fields["message_id"], folder),
             ) as cur:
                 if await cur.fetchone():
-                    return uid
+                    return False
 
         cur = await conn.execute(
             """INSERT OR IGNORE INTO emails
@@ -219,7 +291,6 @@ async def _fetch_and_store(client, folder: str, uidvalidity: int, uid: int) -> i
             ),
         )
         email_id = cur.lastrowid
-
         if email_id and cur.rowcount and attachments:
             for att in attachments:
                 await conn.execute(
@@ -227,7 +298,6 @@ async def _fetch_and_store(client, folder: str, uidvalidity: int, uid: int) -> i
                        VALUES(?,?,?,?,?)""",
                     (email_id, att["filename"], att["content_type"], att["size"], att["content"]),
                 )
-
         await conn.commit()
 
-    return uid
+    return bool(cur.rowcount)
