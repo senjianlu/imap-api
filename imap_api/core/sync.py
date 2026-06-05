@@ -69,27 +69,45 @@ def parse_imap_date(date_str: str) -> str | None:
 
 
 def parse_fetch_response(lines: list) -> tuple[bytes | None, str, str, int]:
-    """Extract (raw_email, internaldate, flags, size) from a UID FETCH response."""
+    """Extract (raw_email, internaldate, flags, size) from a UID FETCH response.
+
+    aioimaplib puts the IMAP metadata header as one bytes item and the
+    RFC822 literal body as the NEXT bytes item.  The header ends with
+    {N} where N is the literal size.  We detect that sentinel so we do
+    not mistake the metadata line itself for the email body.
+    """
     raw = None
     internaldate = ""
     flags = ""
     size = 0
+    next_is_body = False
+
     for line in lines:
-        if isinstance(line, (bytes, bytearray)):
-            b = bytes(line)
-            if len(b) > 20 and raw is None:
-                raw = b
-        else:
-            s = str(line)
-            m = re.search(r'INTERNALDATE "([^"]+)"', s, re.IGNORECASE)
-            if m:
-                internaldate = m.group(1)
-            m = re.search(r'FLAGS \(([^)]*)\)', s, re.IGNORECASE)
-            if m:
-                flags = m.group(1)
-            m = re.search(r'RFC822\.SIZE (\d+)', s, re.IGNORECASE)
-            if m:
-                size = int(m.group(1))
+        s = (
+            line.decode("utf-8", errors="replace")
+            if isinstance(line, (bytes, bytearray))
+            else str(line)
+        )
+
+        if next_is_body:
+            raw = bytes(line) if isinstance(line, (bytes, bytearray)) else s.encode()
+            next_is_body = False
+            continue
+
+        # Metadata line ends with {N} — the next item is the literal body
+        if re.search(r"\{\d+\}\s*$", s):
+            next_is_body = True
+
+        m = re.search(r'INTERNALDATE "([^"]+)"', s, re.IGNORECASE)
+        if m:
+            internaldate = m.group(1)
+        m = re.search(r'FLAGS \(([^)]*)\)', s, re.IGNORECASE)
+        if m:
+            flags = m.group(1)
+        m = re.search(r'RFC822\.SIZE (\d+)', s, re.IGNORECASE)
+        if m:
+            size = int(m.group(1))
+
     return raw, internaldate, flags, size
 
 
