@@ -17,6 +17,8 @@ async def list_emails(
     unseen: bool = False,
     since: str | None = None,
     search: str | None = None,
+    from_: str | None = Query(default=None, alias="from"),
+    to: str | None = None,
     _: None = Depends(verify_token),
 ):
     conn = db.get_db()
@@ -35,6 +37,12 @@ async def list_emails(
     if search:
         conditions.append("(subject LIKE ? OR from_addr LIKE ?)")
         params += [f"%{search}%", f"%{search}%"]
+    if from_:
+        conditions.append("from_addr LIKE ?")
+        params.append(f"%{from_}%")
+    if to:
+        conditions.append("to_addr LIKE ?")
+        params.append(f"%{to}%")
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
