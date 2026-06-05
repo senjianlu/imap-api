@@ -1,0 +1,23 @@
+services:
+  imap-api:
+    image: rabbir/imap-api:latest
+    container_name: imap-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    environment:
+      IMAP_HOST: ${IMAP_HOST}
+      IMAP_PORT: ${IMAP_PORT:-993}
+      IMAP_SSL: ${IMAP_SSL:-true}
+      IMAP_USERNAME: ${IMAP_USERNAME}
+      IMAP_PASSWORD: ${IMAP_PASSWORD}
+      IMAP_FOLDERS: ${IMAP_FOLDERS:-INBOX}
+      IMAP_API_TOKEN: ${IMAP_API_TOKEN:-}
+      IDLE_RECONNECT_INTERVAL: ${IDLE_RECONNECT_INTERVAL:-900}
+      IMAP_MAIL_RETENTION_DAYS: ${IMAP_MAIL_RETENTION_DAYS:-365}
+      INITIAL_SYNC_DAYS: ${INITIAL_SYNC_DAYS:-30}
+      FETCH_BODY: ${FETCH_BODY:-true}
+      STORE_ATTACHMENTS: ${STORE_ATTACHMENTS:-false}
+      MAX_FETCH_SIZE: ${MAX_FETCH_SIZE:-26214400}

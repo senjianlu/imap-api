@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.db
+/data/
+.env
+.git/
+tests/
+README*.md
+CLAUDE.md
