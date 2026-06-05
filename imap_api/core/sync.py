@@ -59,7 +59,7 @@ def parse_flags(raw: str) -> list[str]:
 def parse_imap_date(date_str: str) -> str | None:
     if not date_str:
         return None
-    for fmt in ("%d-%b-%Y %H:%M:%S %z", "%d-%b-%Y %H:%M:%S +0000"):
+    for fmt in ("%d-%b-%Y %H:%M:%S %z",):
         try:
             dt = datetime.strptime(date_str.strip('"'), fmt)
             return dt.astimezone(timezone.utc).isoformat()
@@ -205,8 +205,8 @@ async def incremental_sync(client, folder: str, uidvalidity: int, last_seen_uid:
 
 async def _initial_sync(client, folder: str, uidvalidity: int) -> int:
     if config.INITIAL_SYNC_DAYS == 0:
-        # Just record current max UID as baseline; do not pull history
-        uids = await _uid_range_fetch(client, "*")
+        # Use 1:* range — Zoho (and some other servers) return nothing for bare "*"
+        uids = await _uid_range_fetch(client, "1:*")
         max_uid = max(uids) if uids else 0
         await save_sync_state(folder, uidvalidity, max_uid)
         logger.info("INITIAL_SYNC_DAYS=0: baseline UID %d for %s", max_uid, folder)
