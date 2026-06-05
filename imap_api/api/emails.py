@@ -44,7 +44,7 @@ async def list_emails(
         total = (await cur.fetchone())["total"]
 
     async with conn.execute(
-        f"""SELECT id, uid, folder, from_addr, subject, internal_date, flags,
+        f"""SELECT id, uid, folder, from_addr, to_addr, subject, internal_date, flags,
                    has_attachments, size
             FROM emails {where}
             ORDER BY internal_date DESC
@@ -61,6 +61,7 @@ async def list_emails(
                 "uid": r["uid"],
                 "folder": r["folder"],
                 "from": r["from_addr"],
+                "to": json.loads(r["to_addr"] or "[]"),
                 "subject": r["subject"],
                 "internal_date": r["internal_date"],
                 "flags": json.loads(r["flags"] or "[]"),
